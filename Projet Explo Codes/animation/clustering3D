@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Oct 31 23:28:30 2020
+
+@author: rgenet
+"""
+#
+#
+import numpy as np
+import scipy.sparse as sparse
+import pandas as pd
+import json
+import time
+from sklearn import linear_model
+from sklearn.tree import DecisionTreeClassifier
+from sklearn import metrics
+import copy
+from sklearn.model_selection import GridSearchCV
+from sklearn.cluster import KMeans
+from sklearn.cluster import MeanShift, estimate_bandwidth,DBSCAN
+from sklearn.cluster import AffinityPropagation,AgglomerativeClustering
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+
+t1=time.time()
+def get_number_link(id, df_know_infos, df_train_edges, page_types, link_depth):
+    temp_df=df_train_edges[df_train_edges['id_2'].isin([id])]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin([id])]['id_2'])
+    for iter in range(link_depth):
+        temp_df=df_train_edges[df_train_edges['id_2'].isin(temp_df)]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin(temp_df)]['id_2'])
+    know_links=df_know_infos[df_know_infos['id'].isin(temp_df)]
+    dict={}
+    nb_link=know_links.shape[0]
+    if nb_link>0:
+        for page_type in page_types:
+            dict.update({page_type :know_links[know_links['page_type']==page_type]['id'].count()/nb_link})
+    else:
+        for page_type in page_types:
+            dict.update({page_type : 0})
+    
+    return dict
+
+
+def get_features_ratios(id,features):
+    my_dict={}
+    my_feature=features.get(str(id))
+    my_dict.update({'mean' : np.mean(my_feature)})
+    my_dict.update({'std' : np.std(my_feature)})
+    my_dict.update({'sharpe' :  np.mean(my_feature)/np.std(my_feature)})
+    return my_dict
+
+def create_X(df_target,page_types, df_know_infos, df_edges, features,X_ids ):
+    
+    nb_page_type=len(page_types)
+    nb_ids=len(X_ids)
+    X=np.zeros((nb_ids, nb_page_type*3))
+    for iter in range(nb_ids):
+        id=X_ids[iter]
+        direct_link=get_number_link(id, df_know_infos, df_edges, page_types, 0)
+        second_link=get_number_link(id, df_know_infos, df_edges, page_types, 1)
+        third_link=get_number_link(id, df_know_infos, df_edges, page_types, 2)
+        row_values=list(direct_link.values())+list(second_link.values())+list(third_link.values())
+        X[iter,:]=row_values
+    return X
+
+def create_color_map(y):
+    color_map=[]
+    for iter in range(len(y)):
+        if y[iter] in ["company",0]:
+            color_map.append('blue')
+        elif y[iter] in ["government",1]:
+            color_map.append('green')
+        elif y[iter] in ["tvshow",2]:
+            color_map.append('red')
+        else:
+            color_map.append('black')
+    return color_map
+
+
+###### Create variables #######
+    
+
+df_edges=pd.read_csv("musae_facebook_edges.csv")
+df_target=pd.read_csv("musae_facebook_target.csv")
+features=json.load(open("musae_facebook_features.json"))
+nb_pages=df_target.shape[0] 
+page_types=df_target['page_type'].unique()
+
+X_ids=df_target['id'].values
+df_all_infos=df_target[['id','page_type']]
+df_know_infos=df_target[df_target['id']<nb_pages*0.05][['id','page_type']]
+
+df_train_edges=df_edges[df_edges['id_1']<nb_pages*0.7]
+df_train_target=df_target[df_target['id'].map(lambda x: True if x<0.6*nb_pages and x>0.05*nb_pages else False)==True]
+
+df_test_edges=df_edges
+df_test_target=df_target[df_target['id'].map(lambda x: True if x>0.6*nb_pages else False)==True]
+
+Y_train=df_train_target['page_type'].values
+Y_test=df_test_target['page_type'].values
+
+parameters = {'max_depth':range(1,23), 'criterion' :['gini', 'entropy'],'splitter': ['best','random'], 'min_samples_split' : range(3,6),'min_samples_leaf': range(1,5), 'min_impurity_decrease': [i/10 for i in range(40)] }
+
+
+nb_iter=2
+initial_known_informations=copy.deepcopy(df_know_infos)
+my_decision_trees=[]
+for iter in range(nb_iter):
+    print("starting iteration "+str(iter)+" on training part")
+    X_ids_train=df_train_target['id'].values
+    
+
+    X_train=create_X(df_train_target, page_types, df_know_infos, df_edges,features,X_ids_train)
+    
+    clf = GridSearchCV(DecisionTreeClassifier(), parameters, n_jobs=4)
+    clf.fit(X=X_train, y=Y_train)
+    tree_model = clf.best_estimator_
+    print (clf.best_score_, clf.best_params_) 
+    
+    new_informations=tree_model.predict(X_train)
+    df_know_infos=initial_known_informations.append(pd.DataFrame({'id':X_ids_train, 'page_type':new_informations}))
+    my_decision_trees.append(tree_model)
+    
+    
+df_know_infos=copy.deepcopy(initial_known_informations)
+my_X=[]
+X_ids_test=df_test_target['id'].values
+my_X.append(create_X(df_test_target, page_types, df_all_infos, df_edges,features,X_ids_test))
+print("starting on test set")
+for decision_tree in my_decision_trees:
+    
+    
+    X_test=create_X(df_test_target, page_types, df_know_infos, df_edges,features,X_ids_test)
+    my_X.append(X_test)
+    new_informations=decision_tree.predict(X_test)
+    df_know_infos=initial_known_informations.append(pd.DataFrame({'id':X_ids_test, 'page_type':new_informations}))
+    
+    print("current classification report:")
+    classification_report=metrics.classification_report(Y_test,new_informations)
+    print(classification_report)
+
+X_centered=my_X[0]-my_X[0].mean(axis=0)
+X_partial_info_centered=my_X[1]-my_X[1].mean(axis=0)
+X_guess_info_centered=my_X[2]-my_X[2].mean(axis=0)
+####Create cluster ########
+
+kmeans=KMeans(n_clusters=4, random_state=0).fit(X_centered)
+y_kmeans=kmeans.labels_
+
+kmeans_partial_info=KMeans(n_clusters=4, random_state=0).fit(X_partial_info_centered)
+y_kmeans_partial_info=kmeans_partial_info.labels_
+
+kmeans_guess_info=KMeans(n_clusters=4, random_state=0).fit(X_guess_info_centered)
+y_kmeans_guess_info=kmeans_guess_info.labels_
+
+Agglomerative_clusters = AgglomerativeClustering(n_clusters=4).fit(X_centered)
+y_aglomerative=Agglomerative_clusters.labels_
+
+Agglomerative_clusters_partial_info = AgglomerativeClustering(n_clusters=4).fit(X_partial_info_centered)
+y_aglomerative_partial_info=Agglomerative_clusters_partial_info.labels_
+
+
+Agglomerative_clusters_guess_info = AgglomerativeClustering(n_clusters=4).fit(X_guess_info_centered)
+y_aglomerative_guess_info=Agglomerative_clusters_guess_info.labels_
+
+Y=Y_test
+
+def f(x):
+    if x=='government':
+        x=1
+    elif x=='politician':
+        x=3
+    elif x=='company':
+        x=0
+    else:
+        x=2
+    return x
+
+
+#######   plot scatter plot of differents cluster methods vs real clusters #######
+
+
+y_kmeans_color_map=create_color_map(y_kmeans)
+y_kmeans_partial_info_color_map=create_color_map(y_kmeans_partial_info)
+y_kmeans_guess_info_color_map=create_color_map(y_kmeans_guess_info)
+y_aglomerative_color_map=create_color_map(y_aglomerative)
+y_aglomerative_partial_info_color_map=create_color_map(y_aglomerative_partial_info)
+y_aglomerative_guess_info_color_map=create_color_map(y_aglomerative_guess_info)
+y_color_map=create_color_map(list(map(f,Y)))
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on Y know, Kmeans clusters")
+ax.scatter(my_X[0][:,0], my_X[0][:,1], my_X[0][:,2], s=1, c=y_kmeans_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link Y known with KMeans")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on Y know, Kmeans clusters")
+ax.scatter(my_X[0][:,4], my_X[0][:,5], my_X[0][:,6], s=1, c=y_kmeans_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link Y known with KMeans")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on Y know, Kmeans clusters")
+ax.scatter(my_X[0][:,8], my_X[0][:,9], my_X[0][:,10], s=1, c=y_kmeans_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link Y known with KMeans")
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on Y know, Agglomerative clusters")
+ax.scatter(my_X[0][:,0], my_X[0][:,1], my_X[0][:,2], s=1, c=y_aglomerative_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link Y known with AgglomerativeClustering")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on Y know, Agglomerative clusters")
+ax.scatter(my_X[0][:,4], my_X[0][:,5], my_X[0][:,6], s=1, c=y_aglomerative_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link Y known with AgglomerativeClustering")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on Y know, Agglomerative clusters")
+ax.scatter(my_X[0][:,8], my_X[0][:,9], my_X[0][:,10], s=1, c=y_aglomerative_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link Y known with AgglomerativeClustering")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on Y know, reals clusters")
+ax.scatter(my_X[0][:,0], my_X[0][:,1], my_X[0][:,2], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link Y known with reals")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on Y know, reals clusters")
+ax.scatter(my_X[0][:,4], my_X[0][:,5], my_X[0][:,6], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link Y known with reals")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on Y know, reals clusters")
+ax.scatter(my_X[0][:,8], my_X[0][:,9], my_X[0][:,10], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link Y known with reals")
+
+
+
+
+
+
+
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on 5% Y know, Kmeans clusters")
+ax.scatter(my_X[1][:,0], my_X[1][:,1], my_X[1][:,2], s=1, c=y_kmeans_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link 5percent Y known with KMeans")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on 5% Y know, Kmeans clusters")
+ax.scatter(my_X[1][:,4], my_X[1][:,5], my_X[1][:,6], s=1, c=y_kmeans_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link 5percent Y known with KMeans")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on 5% Y know, Kmeans clusters")
+ax.scatter(my_X[1][:,8], my_X[1][:,9], my_X[1][:,10], s=1, c=y_kmeans_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link 5percent Y known with KMeans")
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on 5% Y know, Agglomerative clusters")
+ax.scatter(my_X[1][:,0], my_X[1][:,1], my_X[1][:,2], s=1, c=y_aglomerative_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link 5percent Y known with AgglomerativeClustering")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on 5% Y know, Agglomerative clusters")
+ax.scatter(my_X[1][:,4], my_X[1][:,5], my_X[1][:,6], s=1, c=y_aglomerative_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link 5percent Y known with AgglomerativeClustering")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on 5% Y know, Agglomerative clusters")
+ax.scatter(my_X[1][:,8], my_X[1][:,9], my_X[1][:,10], s=1, c=y_aglomerative_partial_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link 5percent Y known with AgglomerativeClustering")
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on 5% Y know, reals clusters")
+ax.scatter(my_X[1][:,0], my_X[1][:,1], my_X[1][:,2], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link 5percent Y known with reals")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on 5% Y know, reals clusters")
+ax.scatter(my_X[1][:,4], my_X[1][:,5], my_X[1][:,6], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link 5percent Y known with reals")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on 5% Y know, reals clusters")
+ax.scatter(my_X[1][:,8], my_X[1][:,9], my_X[1][:,10], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link 5percent Y known with reals")
+
+
+
+
+
+
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on guess Y know, Kmeans clusters")
+ax.scatter(my_X[2][:,0], my_X[2][:,1], my_X[2][:,2], s=1, c=y_kmeans_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link guess Y known with KMeans")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on guess Y know, Kmeans clusters")
+ax.scatter(my_X[2][:,4], my_X[2][:,5], my_X[2][:,6], s=1, c=y_kmeans_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link guess Y known with KMeans")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on guess Y know, Kmeans clusters")
+ax.scatter(my_X[2][:,8], my_X[2][:,9], my_X[2][:,10], s=1, c=y_kmeans_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link guess Y known with KMeans")
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on guess Y know, Agglomerative clusters")
+ax.scatter(my_X[2][:,0], my_X[2][:,1], my_X[2][:,2], s=1, c=y_aglomerative_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link guess Y known with AgglomerativeClustering")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on guess Y know, Agglomerative clusters")
+ax.scatter(my_X[2][:,4], my_X[2][:,5], my_X[2][:,6], s=1, c=y_aglomerative_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link guess Y known with AgglomerativeClustering")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on guess Y know, Agglomerative clusters")
+ax.scatter(my_X[2][:,8], my_X[2][:,9], my_X[2][:,10], s=1, c=y_aglomerative_guess_info)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link guess Y known with AgglomerativeClustering")
+
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("direct link, X on guess Y know, reals clusters")
+ax.scatter(my_X[2][:,0], my_X[2][:,1], my_X[2][:,2], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D first link guess Y known with reals")
+
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("second link, X on guess Y know, reals clusters")
+ax.scatter(my_X[2][:,4], my_X[2][:,5], my_X[2][:,6], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D seconds link guess Y known with reals")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_on()
+ax.view_init(azim=120)
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("third link, X on guess Y know, reals clusters")
+ax.scatter(my_X[2][:,8], my_X[2][:,9], my_X[2][:,10], s=1, c=y_color_map)
+ax.set_xlabel("% of "+page_types[0])
+ax.set_ylabel("% of "+page_types[1])
+ax.set_zlabel("% of "+page_types[2])
+plt.savefig("cluster 3D third link guess Y known with reals")

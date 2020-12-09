@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Nov  2 01:56:27 2020
+
+@author: rgenet
+"""
+
+
+import numpy as np
+import scipy.sparse as sparse
+import pandas as pd
+import json
+import time
+from sklearn import linear_model
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn import metrics
+import copy
+from sklearn.model_selection import GridSearchCV
+from imblearn.over_sampling import SMOTE
+import networkx as nx
+import community
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import os
+import cv2
+
+
+def create_color_map(y):
+    color_map=[]
+    for iter in range(len(y)):
+        if y[iter] in ["company",0]:
+            color_map.append('blue')
+        elif y[iter] in ["government",1]:
+            color_map.append('green')
+        elif y[iter] in ["tvshow",2]:
+            color_map.append('red')
+        else:
+            color_map.append('black')
+    return color_map
+
+t1=time.time()
+def get_number_link(id, df_know_infos, df_train_edges, page_types, link_depth):
+    temp_df=df_train_edges[df_train_edges['id_2'].isin([id])]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin([id])]['id_2'])
+    for iter in range(link_depth):
+        temp_df=df_train_edges[df_train_edges['id_2'].isin(temp_df)]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin(temp_df)]['id_2'])
+    know_links=df_know_infos[df_know_infos['id'].isin(temp_df)]
+    dict={}
+    nb_link=know_links.shape[0]
+    dict.update({'nb_link': nb_link})
+    if nb_link>0:
+        for page_type in page_types:
+            dict.update({page_type :know_links[know_links['page_type']==page_type]['id'].count()/nb_link})
+    else:
+        for page_type in page_types:
+            dict.update({page_type : 0})
+    
+    return dict
+
+def get_features_ratios(id,features):
+    my_dict={}
+    my_feature=features.get(str(id))
+    my_dict.update({'mean' : np.mean(my_feature)})
+    my_dict.update({'std' : np.std(my_feature)})
+    my_dict.update({'sharpe' :  np.mean(my_feature)/np.std(my_feature)})
+    my_dict.update({'nb_obs' :  len(my_feature)})
+    my_dict.update({'sum' :  sum(my_feature)})
+    return my_dict
+
+def create_X(df_target,page_types, df_know_infos, df_edges, features,X_ids,partition_dict ):
+    
+    nb_page_type=len(page_types)
+    nb_ids=len(X_ids)
+    X=np.zeros((nb_ids, nb_page_type*4+10))
+    for iter in range(nb_ids):
+        id=X_ids[iter]
+        direct_link=get_number_link(id, df_know_infos, df_edges, page_types, 0)
+        second_link=get_number_link(id, df_know_infos, df_edges, page_types, 1)
+        third_link=get_number_link(id, df_know_infos, df_edges, page_types, 2)
+        fourth_link=get_number_link(id, df_know_infos, df_edges, page_types, 3)
+        id_features=get_features_ratios(id, features)
+        id_partition=partition_dict.get(id)
+        row_values=[id_partition]+list(direct_link.values())+list(second_link.values())+list(third_link.values())+list(fourth_link.values())+list(id_features.values())
+        X[iter,:]=row_values
+    return X
+
+def create_X_reduced(df_target,page_types, df_know_infos, df_edges, features,X_ids ):
+    
+    nb_page_type=len(page_types)
+    nb_ids=len(X_ids)
+    X=np.zeros((nb_ids, nb_page_type*3))
+    for iter in range(nb_ids):
+        id=X_ids[iter]
+        direct_link=get_number_link_reduced(id, df_know_infos, df_edges, page_types, 0)
+        second_link=get_number_link_reduced(id, df_know_infos, df_edges, page_types, 1)
+        third_link=get_number_link_reduced(id, df_know_infos, df_edges, page_types, 2)
+        row_values=list(direct_link.values())+list(second_link.values())+list(third_link.values())
+        X[iter,:]=row_values
+    return X
+
+def get_number_link_reduced(id, df_know_infos, df_train_edges, page_types, link_depth):
+    temp_df=df_train_edges[df_train_edges['id_2'].isin([id])]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin([id])]['id_2'])
+    for iter in range(link_depth):
+        temp_df=df_train_edges[df_train_edges['id_2'].isin(temp_df)]['id_1'].append(df_train_edges[df_train_edges['id_1'].isin(temp_df)]['id_2'])
+    know_links=df_know_infos[df_know_infos['id'].isin(temp_df)]
+    dict={}
+    nb_link=know_links.shape[0]
+    if nb_link>0:
+        for page_type in page_types:
+            dict.update({page_type :know_links[know_links['page_type']==page_type]['id'].count()/nb_link})
+    else:
+        for page_type in page_types:
+            dict.update({page_type : 0})
+    
+    return dict
+
+parameters = {'max_depth':range(1,23), 'criterion' :['gini', 'entropy'],'splitter': ['best','random'], 'min_samples_split' : range(3,6),'min_samples_leaf': range(1,5), 'min_impurity_decrease': [i/10 for i in range(40)] }
+
+
+df_edges=pd.read_csv("musae_facebook_edges.csv")
+df_target=pd.read_csv("musae_facebook_target.csv")
+features=json.load(open("musae_facebook_features.json"))
+nb_pages=df_target.shape[0] 
+page_types=df_target['page_type'].unique()
+
+df_know_infos=df_target[df_target['id']<nb_pages*0.05][['id','page_type']]
+Unknow_id=list(df_target[df_target['id']>nb_pages*0.05]['id'].values)
+id_train, id_test =train_test_split(Unknow_id, test_size=0.4, shuffle=True)
+
+
+df_train_target=df_target[df_target['id'].map(lambda x: x in id_train)]
+
+df_test_target=df_target[df_target['id'].map(lambda x: x in id_test)]
+
+Y_train=df_train_target['page_type'].values
+Y_test=df_test_target['page_type'].values
+
+
+X_ids=df_target['id'].values
+G = nx.Graph()
+G.add_nodes_from(X_ids)
+ids_1 = df_edges['id_1'].values
+ids_2 = df_edges['id_2'].values
+for iter in range(len(ids_1)):
+    G.add_edge(ids_1[iter],ids_2[iter])
+partition_dict = community.best_partition(G)
+
+
+nb_iter=5
+initial_known_informations=copy.deepcopy(df_know_infos)
+my_decision_trees=[]
+for iter in range(nb_iter):
+    print("starting iteration "+str(iter)+" on training part")
+    X_ids_train=df_train_target['id'].values
+    
+
+    X_train=create_X(df_train_target, page_types, df_know_infos, df_edges,features,X_ids_train,partition_dict)
+    
+    X_train_resampled, Y_train_resampled=SMOTE().fit_resample(X_train,Y_train)
+    
+    clf = GridSearchCV(DecisionTreeClassifier(), parameters, n_jobs=4)
+    clf.fit(X=X_train, y=Y_train)
+    tree_model = clf.best_estimator_
+    print (clf.best_score_, clf.best_params_) 
+    
+    new_informations=tree_model.predict(X_train)
+    df_know_infos=initial_known_informations.append(pd.DataFrame({'id':X_ids_train, 'page_type':new_informations}))
+    my_decision_trees.append(tree_model)
+    
+#initial_known_informations=initial_known_informations.append(df_train_target[['id','page_type']])
+df_know_infos=copy.deepcopy(initial_known_informations)
+print("starting on test set")
+for decision_tree in my_decision_trees:
+    X_ids_test=df_test_target['id'].values
+    
+    X_test=create_X(df_test_target, page_types, df_know_infos, df_edges,features,X_ids_test,partition_dict)
+    
+    new_informations=decision_tree.predict(X_test)
+    df_know_infos=initial_known_informations.append(pd.DataFrame({'id':X_ids_test, 'page_type':new_informations}))
+    
+    print("current classification report:")
+    classification_report=metrics.classification_report(Y_test,new_informations)
+    print(classification_report)
+    
+
+for decision_tree in my_decision_trees:
+    
+    new_informations=decision_tree.predict(X_test)
+    accuracy=metrics.accuracy_score(Y_test,new_informations)
+    classification_report=metrics.classification_report(Y_test,new_informations)
+    print(classification_report)
+    df_know_infos=initial_known_informations.append(pd.DataFrame({'id':X_ids_test, 'page_type':new_informations}))
+
+confusion_matrix=metrics.confusion_matrix(Y_test, new_informations)
+print(confusion_matrix)
+
+print("elapsed time "+str(time.time()-t1)+" seconds")
+
+features_importance=np.zeros((8,26))
+df_know_infos=copy.deepcopy(initial_known_informations)
+count=0
+for decision_tree in my_decision_trees:
+    features_importance[count,:]=decision_tree.feature_importances_
+    count+=1
+    
+df_features_importance=pd.DataFrame(features_importance)
+df_features_importance.columns=['community','first know links','first know tvshow','first know government','first know company','first know politician',
+                                'second know links','second know tvshow','second know government','second know company','second know politician',
+                                'third know links','third know tvshow','third know government','third know company','third know politician',
+                                'fourth know links','fourth know tvshow','fourth know government','fourth know company','fourth know politician',
+                                'mean word description','std word description','mean over std','nb_description','total words']
+#df_features_importance.rename(index=['first iteration','second iteration','third iteration','fourth iteration'])
+
+
+def dict_pos(t):#,h):
+    my_dict={}
+    pos=0
+    for node in t:
+        if my_dict.get(node) is None:
+            my_dict.update({node: pos})
+            pos+=1
+#    for node in h:
+#        if my_dict.get(node) is None:
+#            my_dict.update({node: pos})
+#            pos+=1    
+    return my_dict
+
+def make_edge_dict(df_edges):
+    edges=df_edges.values
+    my_dict={}
+    for iter in range(len(edges)):
+        if my_dict.get(edges[iter,0]) is not None:
+            current_list=my_dict.get(edges[iter,0])
+        else:
+            current_list=[]
+        my_dict.update({edges[iter,0]: current_list+[edges[iter,1]]})
+        if my_dict.get(edges[iter,1]) is not None:
+            current_list=my_dict.get(edges[iter,1])
+        else:
+            current_list=[]
+        my_dict.update({edges[iter,1]: current_list+[edges[iter,0]]})
+    return my_dict
+
+t=X_ids_test
+edge_dict=make_edge_dict(df_edges)
+pos_dict=dict_pos(X_ids)
+
+
+graph_pos = nx.spring_layout(G, dim=3)
+xyz = np.array([graph_pos[v] for v in G])
+print(xyz.shape)
+list_start=[]
+list_reached=[]
+node_number=0
+xyz_test=np.zeros((len(t),3))
+for start_node in t:
+    t_edges=edge_dict.get(start_node)
+    xyz_test[node_number,:]=xyz[pos_dict.get(start_node)]
+    for node_reached in t_edges:
+        temp_1=[]
+        temp_2=[]
+        if node_reached in t[:node_number]:
+            for col in range(3):
+                temp_1.append(xyz[pos_dict.get(start_node),col])
+                temp_2.append(xyz[pos_dict.get(node_reached),col])
+            list_start.append(temp_1)
+            list_reached.append(temp_2)
+    node_number+=1
+    
+my_edges=np.zeros((len(list_reached), 6))
+for iter_2 in range(len(list_start)):
+    for col in range(3):
+        my_edges[iter_2,2*col]=list_start[iter_2][col]
+        my_edges[iter_2,2*col+1]=list_reached[iter_2][col]
+        
+y_results_color_map=create_color_map(new_informations)
+y_real_color_map=create_color_map(Y_test)
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_off()
+
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("Results of classification")
+ax.scatter(xyz_test[:,0], xyz_test[:,1], xyz_test[:,2], s=1, c=y_results_color_map)
+for i in range(my_edges.shape[0]):
+    ax.plot(my_edges[i,0:2], my_edges[i,2:4],
+                my_edges[i,4:6],linewidth=0.005, color='black')#, color=(0.2, 1 - 0.1 * i, 0.8))
+for iter in range(0,360):
+    ax.view_init(elev=10, azim=iter)
+    if iter<10:
+        plt.savefig("/tmp/rgenet/image_animation_result/imag00"+str(iter)+".png")
+    elif iter<100:
+        plt.savefig("/tmp/rgenet/image_animation_result/imag0"+str(iter)+".png")
+    else:
+        plt.savefig("/tmp/rgenet/image_animation_result/imag"+str(iter)+".png")
+
+
+fig = plt.figure(figsize=(20,10))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_axis_off()
+# make the panes transparent
+ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+# make the grid lines transparent
+ax.xaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.yaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.zaxis._axinfo["grid"]['color'] =  (1,1,1,0)
+ax.set_title("Real values")
+ax.scatter(xyz_test[:,0],xyz_test[:,1], xyz_test[:,2], s=0.25, c=y_real_color_map)
+for i in range(my_edges.shape[0]):
+    ax.plot(my_edges[i,0:2], my_edges[i,2:4],
+                my_edges[i,4:6],linewidth=0.01, color='black')#, color=(0.2, 1 - 0.1 * i, 0.8))
+for iter in range(0,360):
+    ax.view_init(elev=10, azim=iter)
+    if iter<10:
+        plt.savefig("/tmp/rgenet/image_animation_real/imag00"+str(iter)+".png")
+    elif iter<100:
+        plt.savefig("/tmp/rgenet/image_animation_real/imag0"+str(iter)+".png")
+    else:
+        plt.savefig("/tmp/rgenet/image_animation_real/imag"+str(iter)+".png")
+
+
+image_folder = '/tmp/rgenet/image_animation_result/'
+
+
+video_name = 'real_vs_result_classic_Y_animation.avi'
+
+
+images = [img for img in os.listdir(image_folder) if img.endswith(".png")]
+images.sort()
+frame = cv2.imread(os.path.join(image_folder, images[0]))
+height, width, layers = frame.shape
+
+video = cv2.VideoWriter(video_name, 0, 30, (width,height))
+
+for image in images:
+    video.write(cv2.imread(os.path.join(image_folder, image)))
+    
+image_folder = '/tmp/rgenet/image_animation_real/'
+images = [img for img in os.listdir(image_folder) if img.endswith(".png")]
+images.sort()
+for image in images:
+    video.write(cv2.imread(os.path.join(image_folder, image)))
+    
+cv2.destroyAllWindows()
+video.release()
